@@ -1,5 +1,3 @@
-from go2deploy.build import go2py
-# from go2deploy.filter import KalmanFilter3D
 
 import time
 import datetime
@@ -10,257 +8,147 @@ import itertools
 import h5py
 import argparse
 import os
-
-from scipy.spatial.transform import Rotation as R
-from tensordict import TensorDict
+import multiprocessing as mp
+from timer_fd import Timer
 
 from setproctitle import setproctitle
+from scipy.spatial.transform import Rotation as R
+from go2deploy import ONNXModule, init_channel
+from go2deploy.utils import lerp, normalize
+from go2deploy.robot import Go2Iface
+
+from torch.utils._pytree import tree_map
+from dataclasses import dataclass
 
 np.set_printoptions(precision=3, suppress=True, floatmode="fixed")
 
-ORBIT_JOINT_ORDER = [
-    'FL_hip_joint', 'FR_hip_joint', 'RL_hip_joint', 'RR_hip_joint', 
-    'FL_thigh_joint', 'FR_thigh_joint', 'RL_thigh_joint', 'RR_thigh_joint', 
-    'FL_calf_joint', 'FR_calf_joint', 'RL_calf_joint', 'RR_calf_joint'
-]
-
-SDK_JOINT_ORDER = [
-    'FR_hip_joint', 'FR_thigh_joint', 'FR_calf_joint',
-    'FL_hip_joint', 'FL_thigh_joint', 'FL_calf_joint',
-    'RR_hip_joint', 'RR_thigh_joint', 'RR_calf_joint',
-    'RL_hip_joint', 'RL_thigh_joint', 'RL_calf_joint'
-]
+@dataclass
+class BasicObsCfg:
 
 
-def normalize(v: np.ndarray):
-    return v / np.linalg.norm(v)
+    jpos_steps: int = 3
+    jvel_steps: int = 3
+    gyro_steps: int = 3
+    gravity_steps: int = 3
 
 
-class Go2Iface:
+class ImpedanceControl:
 
-    smoothing_length: int = 5
-    smoothing_ratio: float = 0.4
-    command_dim: int
+    oscillator_history: bool = False
+    command_dim: int = 10 + 3 * 4
 
-    def __init__(self, cfg, log_file: h5py.File=None):
-        self.cfg = cfg
-        self.log_file = log_file
+    def __init__(
+        self,
+        robot: Go2Iface,
+        obs_cfg: BasicObsCfg,
+    ):
+        self.robot = robot
+        self.obs_cfg = obs_cfg
 
-        self.acc_bias = np.array([0.851, 0.310, 9.580])
-
-        self._robot = go2py.RobotIface()
-        self._robot.start_control(interval=2000)
-        self.default_joint_pos = np.array(
-            [
-                0.1, -0.1,  0.1, -0.1,  
-                0.78,  0.78,  0.75,  0.75, 
-                -1.5, -1.5, -1.5, -1.5
-            ], 
-        )
+        self.phi = np.zeros(4, dtype=np.float32)
+        self.phi[0] = np.pi
+        self.phi[3] = np.pi
+        self.phi_history = np.zeros((4, 4))
+        self.phi_dot = np.zeros(4)
+        self.omega = math.pi * 4
         
-        self.dt = 0.02
-        self.latency = 0.0
-        self.rpy = np.zeros(3)
-        self.angvel_history = np.zeros((3, self.smoothing_length))
-        self.projected_gravity_history = np.zeros((3, self.smoothing_length))
-        self.angvel = np.zeros(3)
-        self.action_buf = np.zeros((12, 4))
-        self.command = np.zeros(self.command_dim)
-        self.lxy = 0.
-        self.rxy = 0.
-        self.action_buf_steps = 3
-        self.last_action = np.zeros(12)
-        self.start_t = time.perf_counter()
-        self.timestamp = time.perf_counter()
-        self.step_count = 0
+        self.robot._robot.set_kp(25.)
+        self.robot._robot.set_kd(0.5)
 
-        # self.kalman_filter = KalmanFilter3D()
-        self.update_state()
-        self.update_command()
-        _obs = self._compute_obs()
-        self.obs_dim = _obs.shape[0]
-        self.obs_buf = np.zeros((self.obs_dim * 6))
-        
-        if self.log_file is not None:
-            default_len = 50 * 60
-            self.log_file.attrs["cursor"] = 0
-            log_file.create_dataset("observation", (default_len, self.obs_dim), maxshape=(None, self.obs_dim))
-            log_file.create_dataset("action", (default_len, 12), maxshape=(None, 12))
+        self.command = np.zeros(self.command_dim, dtype=np.float32)
 
-            log_file.create_dataset("rpy", (default_len, 3), maxshape=(None, 3))
-            log_file.create_dataset("jpos", (default_len, 12), maxshape=(None, 12))
-            log_file.create_dataset("jvel", (default_len, 12), maxshape=(None, 12))
-            log_file.create_dataset("jpos_des", (default_len, 12), maxshape=(None, 12))
-            log_file.create_dataset("tau_est", (default_len, 12), maxshape=(None, 12))
-            log_file.create_dataset("quat", (default_len, 4), maxshape=(None, 4))
-            log_file.create_dataset("linvel", (default_len, 3), maxshape=(None, 3))
-            log_file.create_dataset("angvel", (default_len, 3), maxshape=(None, 3))
+        self.jpos_multistep = np.zeros((self.obs_cfg.jpos_steps, 12))
+        self.jvel_multistep = np.zeros((self.obs_cfg.jvel_steps, 12))
+        self.gyro_multistep = np.zeros((self.obs_cfg.gyro_steps, 3))
+        self.gravity_multistep = np.zeros((self.obs_cfg.gravity_steps, 3))
     
-    def reset(self):
-        self.start_t = time.perf_counter()
-        self.update_state()
-        self.update_command()
-        return self._compute_obs()
-    
-    def update_state(self):
-        self.robot_state = self._robot.get_robot_state()
-
-        self.prev_rpy = self.rpy
-        # self.rpy = self._robot.get_rpy()
-        (
-            self.jpos_sdk, self.jvel_sdk, self.tau_sdk,
-            self.rpy, angvel, self.feet_force
-        ) = np.split(self._robot.get_full_state(), [12, 24, 36, 39, 42])
-        
-        self.jpos_sim = self.sdk_to_orbit(self.jpos_sdk)
-        self.jvel_sim = self.sdk_to_orbit(self.jvel_sdk)
-        self.tau_sim = self.sdk_to_orbit(self.tau_sdk)
-
-        dt = time.perf_counter() - self.timestamp
-        
-        # angvel = ((self.rpy - self.prev_rpy) / dt).clip(-3, 3)
-        self.angvel_history = np.roll(self.angvel_history, -1, axis=1)
-        self.angvel_history[:, -1] = angvel
-        self.angvel = mix(self.angvel, self.angvel_history.mean(axis=1), self.smoothing_ratio)
-        
-        self.projected_gravity_history[:, 1:] = self.projected_gravity_history[:, :-1]
-        self.projected_gravity_history[:, 0] = self._robot.get_projected_gravity()
-        self.projected_gravity = normalize(self.projected_gravity_history.mean(1))
-
-        self.lxy = mix(self.lxy, self._robot.lxy(), 0.5)
-        self.rxy = mix(self.rxy, self._robot.rxy(), 0.5)
-        # self.latency = (datetime.datetime.now() - self._robot.timestamp).total_seconds()
-
     def update_command(self):
-        pass
-    
-    def step(self, action=None):
-        if action is not None:
-            self.action_buf[:, 1:] = self.action_buf[:, :-1]
-            self.action_buf[:, 0] = action.clip(-6, 6)
+        mass = 3 
+        lin_kp = (10 + 2) * 0.5 + (10 - 2) * 0.5 * self.robot.robot_state.rxy[1]
+        lin_kd = 2. * math.sqrt(lin_kp)
 
-            # _action = 0.2 * self.action_buf[:, 1] + 0.8 * self.action_buf[:, 0]
-            self.last_action = self.last_action * 0.2 + self.action_buf[:, 0] * 0.8
-            jpos_target = self.last_action * 0.5 + self.default_joint_pos
-            jpos_target = jpos_target.clip(-np.pi, np.pi)
-            self.jpos_target = jpos_target
-            self._robot.set_command(self.orbit_to_sdk(jpos_target))
-        self.update_state()
-        self.update_command()
-        self._maybe_log()
-        self.step_count += 1
-        obs = self._compute_obs()
+        ang_kp = 16.
+        ang_kd = 2. * math.sqrt(ang_kp)
 
-        self.obs_buf = np.roll(self.obs_buf, -self.obs_dim)
-        self.obs_buf[-self.obs_dim:] = obs
+        self.command[0] = self.robot.robot_state.lxy[1] * lin_kd / lin_kp
+        self.command[1] = - self.robot.robot_state.lxy[0] * lin_kd / lin_kp
+        self.command[2] = 0.0 # 0.2 * self.rxy[1] - rpy[1] # pitch
+        self.command[3:5] = self.command[:2] * lin_kp
+        self.command[5:8] = lin_kd
+        self.command[8] = - 1.0 * self.robot.robot_state.rxy[0] # yaw
+        self.command[9:10] = mass
+
+        dt = 0.02
+        move = True # np.abs(self.command[:3]).sum() > 0.1
+        if move:
+            dphi = self.omega # + self.trot(self.phi)
+        else:
+            dphi = self.stand(self.phi)
+        self.phi_dot[:] = dphi
+        self.phi = (self.phi + self.phi_dot * dt) % (2 * np.pi)
+        self.phi_history = np.roll(self.phi_history, 1, axis=0)
+        self.phi_history[0] = self.phi
+
+        if self.oscillator_history:
+            phi_sin = np.sin(self.phi_history)
+            phi_cos = np.cos(self.phi_history)
+        else:
+            phi_sin = np.sin(self.phi)
+            phi_cos = np.cos(self.phi)
         
-        return obs
+        osc = np.concatenate([phi_sin, phi_cos, self.phi_dot], axis=-1)
+        self.command[10:] = osc.reshape(-1)
+        return self.command
 
-    def _compute_obs(self):
-        raise NotImplementedError
-    
-    def _maybe_log(self):
-        if self.log_file is None:
-            return
-        self.log_file["action"][self.step_count] = self.action_buf[:, 0]
-        self.log_file["angvel"][self.step_count] = self.angvel
-        self.log_file["linvel"][self.step_count] = self._robot.get_velocity()
-        self.log_file["rpy"][self.step_count] = self.rpy
-        self.log_file["jpos"][self.step_count] = self.jpos_sim
-        self.log_file["jvel"][self.step_count] = self.jvel_sim
-        self.log_file["jpos_des"][self.step_count] = self.jpos_target
-        self.log_file["tau_est"][self.step_count] = self.tau_sim
-        self.log_file.attrs["cursor"] = self.step_count
+    def compute_obs(self):
+        # common
+        self.jpos_multistep = np.roll(self.jpos_multistep, shift=1, axis=0)
+        self.jpos_multistep[0] = self.robot.robot_state.jpos
+        self.jvel_multistep = np.roll(self.jvel_multistep, shift=1, axis=0)
+        self.jvel_multistep[0] = self.robot.robot_state.jvel
 
-        if self.step_count == self.log_file["jpos"].len() - 1:
-            new_len = self.step_count + 1 + 3000
-            print(f"Extend log size to {new_len}.")
-            for key, value in self.log_file.items():
-                value.resize((new_len, value.shape[1]))
+        self.gyro_multistep = np.roll(self.gyro_multistep, shift=1, axis=0)
+        self.gyro_multistep[0] = self.robot.robot_state.angvel
 
-    @staticmethod
-    def orbit_to_sdk(joints: np.ndarray):
-        return np.flip(joints.reshape(3, 2, 2), axis=2).transpose(1, 2, 0).reshape(-1)
-    
-    @staticmethod
-    def sdk_to_orbit(joints: np.ndarray):
-        return np.flip(joints.reshape(2, 2, 3), axis=1).transpose(2, 0, 1).reshape(-1)
+        self.gravity_multistep = np.roll(self.gravity_multistep, shift=1, axis=0)
+        self.gravity_multistep[0] = self.robot.robot_state.projected_gravity
 
-    def process_action(self, action: np.ndarray):
-        return self.orbit_to_sdk(action * 0.5 + self.default_joint_pos)
-    
-    def process_action_inv(self, jpos_sdk: np.ndarray):
-        return (self.sdk_to_orbit(jpos_sdk) - self.default_joint_pos) / 0.5
+        jpos_multistep = self.jpos_multistep.copy()
+        jvel_multistep = self.jvel_multistep.copy()
 
-
-def mix(a, b, alpha):
-    return a * (1 - alpha) + alpha * b
-
-
-class Go2Vel(Go2Iface):
-    
-    command_dim: int = 4 # linvel_xy, angvel_z, base_height
-
-    def update_command(self):
-        t = time.perf_counter() - self.start_t
-        vx = np.sin(t * 0.75)
-        self.command[0] = mix(self.command[0] * 0.95, self.lxy[1] * 2.0, 0.2)
-        self.command[1] = mix(self.command[1], -self.lxy[0], 0.2)
-
-        self.command[2] = -self.rxy[0] * 1.2
-        self.command[3] = 0.75 #
-
-    def _compute_obs(self):
-        # self.rot = R.from_euler("xyz", self.rpy)
-        # angvel = self.rot.inv().apply(self.angvel)
-        angvel = self.angvel
-        
         obs = [
-            self.command,
-            # angvel,
-            self.projected_gravity,
-            self.jpos_sim,
-            self.jvel_sim,
-            self.action_buf[:, :self.action_buf_steps].reshape(-1),
+            self.gravity_multistep.reshape(-1),
+            jpos_multistep.reshape(-1),
+            jvel_multistep.reshape(-1),
+            self.robot.action_buf[:, :3].reshape(-1),
         ]
         obs = np.concatenate(obs, dtype=np.float32)
         return obs
+    
+    def trot(self,phi: torch.Tensor):
+        dphi = np.zeros(4)
+        dphi[0] = (phi[3] - phi[0]) # + ((phi[1] + math.pi - phi[0]) % (2 * math.pi))
+        dphi[1] = (phi[2] - phi[1]) + ((phi[0] + math.pi - phi[1]) % (2 * math.pi))
+        dphi[2] = (phi[1] - phi[2]) + ((phi[0] + math.pi - phi[2]) % (2 * math.pi))
+        dphi[3] = (phi[0] - phi[3]) # + ((phi[1] + math.pi - phi[3]) % (2 * math.pi))
+        return dphi
+
+    def stand(self, phi: torch.Tensor, target=math.pi * 3 / 2):
+        dphi = 2.0 * ((target - phi) % (2 * math.pi))
+        return dphi
 
 
-class Go2Impd(Go2Iface):
-
-    command_dim: int = 10 # setpose_xy, setpose_yaw, kp_xy, kp_yaw, kd_xyz, vmass
-
-    def update_command(self):
-        kp = (self.rxy[1] + 1) / 2 * (10 - 2) + 2
-        kd = 2 * math.sqrt(kp)
-        self.command[0] = self.lxy[1]
-        self.command[1] = 0.0
-        self.command[2] = 0.0
-        self.command[3:5] = self.command[:2] * kp
-        self.command[5:8] = kd
-        self.command[8:9] = self.command[2] * kp
-        self.command[9:10] = 4.0
-
-    def _compute_obs(self):
-        # self.rot = R.from_euler("xyz", self.rpy)
-        # angvel = self.rot.inv().apply(self.angvel)
-        angvel = self.angvel
-        
-        obs = [
-            # angvel,
-            self.projected_gravity,
-            self.jpos_sim,
-            self.jvel_sim,
-            self.action_buf[:, :self.action_buf_steps].reshape(-1),
-        ]
-        obs = np.concatenate(obs, dtype=np.float32)
-        return obs
+def loop_rate(loop_cnt: mp.Value, policy_cnt: mp.Value):
+    timer = Timer(1.0)
+    while True:
+        print(f"Loop freq: {loop_cnt.value}, Policy freq: {policy_cnt.value}")
+        loop_cnt.value = 0
+        policy_cnt.value = 0
+        timer.sleep()
 
 
-from torchrl.envs.utils import set_exploration_type, ExplorationType
-
-
+@torch.inference_mode()
+# @set_exploration_type(ExplorationType.MODE)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--path", type=str)
@@ -270,7 +158,7 @@ def main():
     timestr = datetime.datetime.now().strftime("%m-%d_%H-%M-%S")
     setproctitle("play_go2")
 
-    go2py.init_channel("enp58s0")
+    init_channel("eth0")
 
     init_pos = np.array([
         0.0, 0.9, -1.8, 
@@ -285,58 +173,64 @@ def main():
     else:
         log_file = None
 
-    robot = Go2Impd({}, log_file)
-    
-    robot._robot.set_kp(25.)
-    robot._robot.set_kd(0.5)
+    robot = Go2Iface({})
+    client = ImpedanceControl(robot, BasicObsCfg())    
 
     path = args.path
-    policy = torch.load(path)
-    policy.module[0].set_missing_tolerance(True)
-    # policy = lambda td: torch.zeros(12)
+    if path.endswith(".onnx"):
+        backend = "onnx"
+        policy_module = ONNXModule(path)
+        def policy(inp):
+            out = policy_module(inp)
+            action = out["action"].reshape(-1)
+            carry = {k[1]: v for k, v in out.items() if k[0] == "next"}
+            return action, carry
+    else:
+        raise NotImplementedError
+        backend = "torch"
+        policy_module = torch.load(path)
+        policy_module.module[0].set_missing_tolerance(True)
+        def policy(inp):
+            inp = TensorDict(tree_map(torch.as_tensor, inp), [1])
+            out = policy_module(inp)
+            action = out["action"].numpy().reshape(-1)
+            carry = dict(out["next"])
+            return action, carry
 
-    robot._robot.set_command(init_pos)
-    obs = robot.reset()
-    obs = robot._compute_obs()
-    print(obs.shape)
-    print(policy)
-    # policy.module.pop(0)
+    cmd = client.update_command()
+    obs = client.compute_obs()
+    
+    loop_cnt = mp.Value("i", 0)
+    policy_cnt = mp.Value("i", 0)
+    
+    mp.Process(target=loop_rate, args=(loop_cnt, policy_cnt)).start()
 
     try:
-        td = TensorDict({
-            "command": torch.as_tensor(robot.command, dtype=torch.float32),
-            "policy": torch.as_tensor(obs),
-            "is_init": torch.tensor(1, dtype=bool),
-            "adapt_hx": torch.zeros(128),
-            "estimator_hx": torch.zeros(128),
-        }, []).unsqueeze(0)
-        with torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
-            for i in itertools.count():
-                start = time.perf_counter()
-                # policy(td)
-                # action = td["action"].cpu().numpy()
-                # print(action)
-                # print(td["state_value"].item())
-                # print(processed_actions)
-                # print(robot._robot.get_joint_pos_target())
-                # obs = torch.as_tensor(robot._compute_obs())
-                action = None
-                obs = torch.as_tensor(robot.step(action))
-                td["next", "command"] = torch.as_tensor(robot.command, dtype=torch.float32).unsqueeze(0)
-                td["next", "policy"] = obs.unsqueeze(0)
-                td["next", "is_init"] = torch.tensor([0], dtype=bool)
+        inp = {
+            "is_init": np.array([True]),
+            "adapt_hx": np.zeros((1, 128), dtype=np.float32),
+            "context_adapt_hx": np.zeros((1, 128), dtype=np.float32),
+        }
+        timer = Timer(0.005)
+        for i in itertools.count():
+            
+            iter_start = time.perf_counter()
+            robot.update_state()
 
-                if i % 25 == 0:
-                    # print(robot.projected_gravity)
-                    print(robot.command)
-                    print(robot.robot_state.rpy)
-                    # print(robot.robot_state.acc - robot.acc_bias, robot.robot_state.gyro)
-                    # print(robot.robot_state.time_since_state_update, robot.robot_state.state_update_interval)
-                    # print(robot.jpos_sdk.reshape(4, 3))
-                    # print(robot.sdk_to_orbit(robot.jpos_sdk).reshape(3, 4))
-
-                td = td["next"]
-                time.sleep(max(0, 0.02 - (time.perf_counter() - start)))
+            if i % 4 == 0:
+                cmd = client.update_command()
+                obs = client.compute_obs()
+                inp["command_"]  = cmd[None, ...]
+                inp["policy"]   = obs[None, ...]
+                inp["is_init"]  = np.array([False], dtype=bool)
+                
+                action, carry = policy(inp)
+                robot.apply_action(action, alpha=0.7)
+                inp = carry
+                policy_cnt.value += 1
+            
+            loop_cnt.value += 1
+            timer.sleep()
 
     except KeyboardInterrupt:
         print("End")

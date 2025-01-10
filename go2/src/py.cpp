@@ -52,42 +52,45 @@ void lerp_(std::array<float, 12>& a, const std::array<float, 12>& b, float t) {
     }
 }
 
-class SecondOrderLowPassFilter {
-    public:
-        SecondOrderLowPassFilter(float cutoff, float fs) {
-            // Compute the filter coefficients (second-order, low-pass)
-            auto nyquist = 0.5 * fs;
-            auto normal_cutoff = cutoff / nyquist;
-            b = {1.0, -2.0 * std::cos(normal_cutoff), 1.0};
-            a = {1.0, -2.0 * std::cos(normal_cutoff), 1.0};
+// class SecondOrderLowPassFilter {
+//     public:
+//         SecondOrderLowPassFilter(float cutoff, float fs) {
+//             // Compute the filter coefficients (second-order, low-pass)
+//             float nyquist = 0.5 * fs;
+//             float normal_cutoff = cutoff / nyquist;
+//             // b = {1.0, -2.0 * std::cos(normal_cutoff), 1.0};
+//             // a = {1.0, -2.0 * std::cos(normal_cutoff), 1.0};
+//             b = {1.0f, -2.0f * static_cast<float>(std::cos(normal_cutoff)), 1.0f};
+//             a = {1.0f, -2.0f * static_cast<float>(std::cos(normal_cutoff)), 1.0f};
 
-            for (int i = 0; i < 12; i++) {
-                x_tm1[i] = 0.0;
-                x_tm2[i] = 0.0;
-                y_tm1[i] = 0.0;
-                y_tm2[i] = 0.0;
-            };
-        }
 
-        void Update(const std::array<float, 12>& x) {
-            for (int i = 0; i < 12; i++) {
-                y[i] = b[0] * x[i] + b[1] * x_tm1[i] + b[2] * x_tm2[i] - a[1] * y_tm1[i] - a[2] * y_tm2[i];
-                x_tm2[i] = x_tm1[i];
-                x_tm1[i] = x[i];
-                y_tm2[i] = y_tm1[i];
-                y_tm1[i] = y[i];
-            }
-        }
+//             for (int i = 0; i < 12; i++) {
+//                 x_tm1[i] = 0.0;
+//                 x_tm2[i] = 0.0;
+//                 y_tm1[i] = 0.0;
+//                 y_tm2[i] = 0.0;
+//             };
+//         }
+
+//         void Update(const std::array<float, 12>& x) {
+//             for (int i = 0; i < 12; i++) {
+//                 y[i] = b[0] * x[i] + b[1] * x_tm1[i] + b[2] * x_tm2[i] - a[1] * y_tm1[i] - a[2] * y_tm2[i];
+//                 x_tm2[i] = x_tm1[i];
+//                 x_tm1[i] = x[i];
+//                 y_tm2[i] = y_tm1[i];
+//                 y_tm1[i] = y[i];
+//             }
+//         }
     
-    private:
-        std::array<float, 3> b = {0.293, 0.586, 0.293};
-        std::array<float, 3> a = {1.0, 0.0, 0.172};
-        std::array<float, 12> x_tm1;
-        std::array<float, 12> x_tm2; 
-        std::array<float, 12> y_tm1;
-        std::array<float, 12> y_tm2;
-        std::array<float, 12> y;
-};
+//     private:
+//         std::array<float, 3> b = {0.293, 0.586, 0.293};
+//         std::array<float, 3> a = {1.0, 0.0, 0.172};
+//         std::array<float, 12> x_tm1;
+//         std::array<float, 12> x_tm2; 
+//         std::array<float, 12> y_tm1;
+//         std::array<float, 12> y_tm2;
+//         std::array<float, 12> y;
+// };
 
 
 class RobotIface

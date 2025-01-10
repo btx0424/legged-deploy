@@ -19,9 +19,9 @@ class CMakeBuild(build_ext):
         subprocess.run(["cmake", sourcedir], cwd=build_temp)
         subprocess.run(["cmake", "--build", "."], cwd=build_temp)
 
-        # generate stubs
-        logging.debug("Generating stubs...")
-        subprocess.run(["pybind11-stubgen", "go2deploy.go2py", "-o", "."], check=True)
+        # # generate stubs
+        # logging.debug("Generating stubs...")
+        # subprocess.run(["pybind11-stubgen", "go2deploy.go2py", "-o", "."], check=True)
 
 setup(
     name="go2deploy",

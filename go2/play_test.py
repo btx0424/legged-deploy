@@ -8,12 +8,14 @@ import itertools
 import h5py
 import argparse
 import os
+import multiprocessing as mp
 
 from setproctitle import setproctitle
 from scipy.spatial.transform import Rotation as R
 from go2deploy import ONNXModule, init_channel, RobotIface, SecondOrderLowPassFilter
 from go2deploy.utils import lerp, normalize
 from torch.utils._pytree import tree_map
+from timer_fd import Timer
 
 try:
     from tensordict import TensorDict
@@ -87,8 +89,10 @@ class Go2Iface:
         self.rpy_prev = np.zeros(3)
         self.rpy_substep = np.zeros((2, 3))
         self.angvel_substep = np.zeros((2, 3))
-        self.gyro_substep = np.zeros((2, 3))
-        self.acc_substep = np.zeros((2, 3))
+        self.smoothing_substeps = 4
+        self.gyro_substep = np.zeros((self.smoothing_substeps, 3))
+        self.acc_substep = np.zeros((self.smoothing_substeps, 3))
+
         self.acc = np.zeros(3)
         self.rot = R.from_quat([1, 0, 0, 0], scalar_first=True)
         
@@ -135,22 +139,20 @@ class Go2Iface:
         self.update_command()
         return self._compute_obs()
     
-    def _update_state(self):
-        for i in itertools.count():
-            self.robot_state = self._robot.get_robot_state()
-            self.jpos_sdk = np.asarray(self.robot_state.jpos)
-            self.jvel_sdk = np.asarray(self.robot_state.jvel)
-            self.jpos_sdk_substep = np.roll(self.jpos_sdk_substep, shift=-1, axis=0)
-            self.jpos_sdk_substep[-1] = self.jpos_sdk
-            self.jvel_sdk_substep = np.roll(self.jvel_sdk_substep, shift=-1, axis=0)
-            self.jvel_sdk_substep[-1] = self.jvel_sdk
-            
-            self.rpy = self.filter_rpy.update(np.asarray(self.robot_state.rpy))
-            self.rot = R.from_quat(self.robot_state.quat, scalar_first=True)
-            # self.gyro = np.asarray(self.robot_state.gyro)
-            self.gyro_substep[i % 2] = np.asarray(self.robot_state.gyro)
-            self.acc_substep[i % 2] = self.filter_acc.update(np.asarray(self.robot_state.acc))
-            time.sleep(0.002)
+    def _update_state(self, i):
+        self.robot_state = self._robot.get_robot_state()
+        self.jpos_sdk = np.asarray(self.robot_state.jpos)
+        self.jvel_sdk = np.asarray(self.robot_state.jvel)
+        self.jpos_sdk_substep = np.roll(self.jpos_sdk_substep, shift=-1, axis=0)
+        self.jpos_sdk_substep[-1] = self.jpos_sdk
+        self.jvel_sdk_substep = np.roll(self.jvel_sdk_substep, shift=-1, axis=0)
+        self.jvel_sdk_substep[-1] = self.jvel_sdk
+        
+        self.rpy = self.filter_rpy.update(np.asarray(self.robot_state.rpy))
+        self.rot = R.from_quat(self.robot_state.quat, scalar_first=True)
+        # self.gyro = np.asarray(self.robot_state.gyro)
+        self.gyro_substep[i % self.smoothing_substeps] = np.asarray(self.robot_state.gyro)
+        self.acc_substep[i % self.smoothing_substeps] = self.filter_acc.update(np.asarray(self.robot_state.acc))
         
     def update_state(self):
         # self.jvel_sdk = self.jvel_sdk_substep.mean(0)
@@ -162,7 +164,7 @@ class Go2Iface:
         self.rpy_prev = self.rpy
         # self.rpy = self.rpy_substep.mean(0)
         self.angvel = (self.rpy - self.rpy_prev) / 0.02
-        self.gyro = lerp(self.gyro, self.gyro_substep.mean(0), 0.5)
+        self.gyro = self.gyro_substep.mean(0)
         self.acc = self.acc_substep.mean(0)
         self.acc = np.where(self.acc < 0.1, 0., self.acc)
 
@@ -174,7 +176,7 @@ class Go2Iface:
     def apply_action(self, action: np.ndarray):
         self.action_buf[:, 1:] = self.action_buf[:, :-1]
         self.action_buf[:, 0] = action.clip(-6, 6)
-        self.last_action = self.last_action * 0.2 + self.action_buf[:, 0] * 0.8
+        self.last_action = self.last_action * 0.5 + self.action_buf[:, 0] * 0.5
 
         jpos_target = self.last_action * 0.5 + self.default_joint_pos
         self.jpos_target_sdk = self.orbit_to_sdk(jpos_target)
@@ -185,12 +187,17 @@ class Go2Iface:
     def _write_cmd(self):
         t0 = time.perf_counter()
         for i in itertools.count():
-            # jpos_target = self.filter.update(self.jpos_target_sdk)
-            jpos_target = self.jpos_target_sdk
+            jpos_target = self.filter.update(self.jpos_target_sdk)
+            # jpos_target = self.jpos_target_sdk
             self._robot.set_command(jpos_target)
             time.sleep(0.005)
             if i % 200 == 0:
                 print("Cmd write freq: ", i / (time.perf_counter() - t0))
+
+    def _send_command(self):
+        jpos_target = self.filter.update(self.jpos_target_sdk)
+        # jpos_target = self.jpos_target_sdk
+        self._robot.set_command(jpos_target)
 
     def get_obs(self):
         self.update_state()
@@ -288,7 +295,9 @@ class Go2Vel(Go2Iface):
 class Go2Impd(Go2Iface):
 
     oscillator_history: bool = False
-    command_dim: int = 13 + 4 * 2 + 4 # linvel_xy, angvel_z, base_height
+    command_dim: int = 10
+    # + 3 * 4
+    command_dim: int = 10 + 3 * 4
 
     def __init__(self, cfg, log_file = None):
         self.phi = np.zeros(4)
@@ -297,15 +306,17 @@ class Go2Impd(Go2Iface):
         self.phi_history = np.zeros((4, 4))
         self.phi_dot = np.zeros(4)
 
-        self.jpos_multistep = np.zeros((4, 12))
-        self.jvel_multistep = np.zeros((4, 12))
-        self.gyro_multistep = np.zeros((4, 3))
+        self.jpos_multistep = np.zeros((3, 12))
+        self.jvel_multistep = np.zeros((3, 12))
+        self.gyro_multistep = np.zeros((3, 3))
+        self.gravity_multistep = np.zeros((3, 3))
+
 
         super().__init__(cfg, log_file)
     
     def update_command(self):
-        mass = 2.0 
-        lin_kp = 16.
+        mass = 3 
+        lin_kp = 24 + 16 * self.rxy[1]
         lin_kd = 2. * math.sqrt(lin_kp)
 
         ang_kp = 16.
@@ -319,17 +330,28 @@ class Go2Impd(Go2Iface):
         # self.command[7:8] = kd
         # self.command[8:9] = 3.0
         # rpy = self.rot.as_euler("xyz")
-        rpy = self.rpy
-        self.command[0] = self.lxy[1] * lin_kd / lin_kp
-        self.command[1] = - self.lxy[0] * lin_kd / lin_kp
+
+
+        # OLD Command, fixed sampled setpoint
+        self.command[0] = self.lxy[1] * 2.0 # * lin_kd / lin_kp
+        self.command[1] = - self.lxy[0] * 2.0 # lin_kd / lin_kp
         self.command[2] = 0.0 # 0.2 * self.rxy[1] - rpy[1] # pitch
-        self.command[3] = - 1.0 * self.rxy[0] # yaw
-        self.command[4:6] = self.command[:2] * lin_kp
-        self.command[6:7] = lin_kd
-        self.command[7:9] = self.command[2:4] * ang_kp
-        self.command[9:10] = ang_kd
-        self.command[10:11] = mass
-        self.command[11:13] = [0., 1.]
+        self.command[3:5] = self.command[:2] * lin_kp
+        self.command[5:8] = lin_kd
+        self.command[8] = - 1.0 * self.rxy[0] # yaw
+        self.command[9:10] = mass
+
+        # New command with pitch
+        # self.command[0] = self.lxy[1] * lin_kd / lin_kp
+        # self.command[1] = - self.lxy[0] * lin_kd / lin_kp
+        # self.command[2:4] = 0.0 # 0.2 * self.rxy[1] - rpy[1] # pitch
+        # self.command[4:6] = self.command[:2] * lin_kp
+        # self.command[6:7] = lin_kd
+        # self.command[7:9] = 0.0
+        # self.command[9:10] = lin_kd
+        # self.command[10:11] = mass
+        # self.command[11] = 1.
+        # self.command[12] = 0.
 
         omega = math.pi * 4
         dt = 0.02
@@ -351,7 +373,7 @@ class Go2Impd(Go2Iface):
             phi_cos = np.cos(self.phi)
         
         osc = np.concatenate([phi_sin, phi_cos, self.phi_dot], axis=-1)
-        self.command[13:] = osc.reshape(-1)
+        self.command[10:] = osc.reshape(-1)
 
     def update_state(self):
         super().update_state()
@@ -361,17 +383,19 @@ class Go2Impd(Go2Iface):
         self.jvel_multistep = np.roll(self.jvel_multistep, shift=1, axis=0)
         self.jvel_multistep[0] = self.jvel_sdk[sdk2isaac]
         self.gyro_multistep = np.roll(self.gyro_multistep, shift=1, axis=0)
-        # self.gyro_multistep[0] = self.robot_state.gyro
         self.gyro_multistep[0] = self.gyro
+        self.gravity_multistep = np.roll(self.gravity_multistep, shift=1, axis=0)
+        self.gravity_multistep[0] = self.gravity
 
     def _compute_obs(self):
         jpos_multistep = self.jpos_multistep.copy()
-        jpos_multistep[1:] = self.jpos_multistep[1:] - self.jpos_multistep[:-1]
+        # jpos_multistep[1:] = self.jpos_multistep[1:] - self.jpos_multistep[:-1]
         jvel_multistep = self.jvel_multistep.copy()
-        jvel_multistep[1:] = self.jvel_multistep[1:] - self.jvel_multistep[:-1]
+        # jvel_multistep[1:] = self.jvel_multistep[1:] - self.jvel_multistep[:-1]
         obs = [
             # self.gyro_multistep.reshape(-1),
-            self.gravity,
+            # self.gravity,
+            self.gravity_multistep.reshape(-1),
             jpos_multistep.reshape(-1),
             jvel_multistep.reshape(-1),
             self.action_buf[:, :3].reshape(-1),
@@ -482,8 +506,17 @@ class Go2Loco(Go2Iface):
         return dphi
 
 
+def loop_rate(loop_cnt: mp.Value, policy_cnt: mp.Value):
+    timer = Timer(1.0)
+    while True:
+        print(f"Loop freq: {loop_cnt.value}, Policy freq: {policy_cnt.value}")
+        loop_cnt.value = 0
+        policy_cnt.value = 0
+        timer.sleep()
+
+
 @torch.inference_mode()
-@set_exploration_type(ExplorationType.MODE)
+# @set_exploration_type(ExplorationType.MODE)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--path", type=str)
@@ -493,7 +526,7 @@ def main():
     timestr = datetime.datetime.now().strftime("%m-%d_%H-%M-%S")
     setproctitle("play_go2")
 
-    init_channel("enp58s0")
+    init_channel("eth0")
 
     init_pos = np.array([
         0.0, 0.9, -1.8, 
@@ -508,7 +541,7 @@ def main():
     else:
         log_file = None
 
-    robot = Go2Loco({}, log_file)
+    robot = Go2Impd({}, log_file)
     
     robot._robot.set_kp(25.)
     robot._robot.set_kd(0.5)
@@ -563,9 +596,13 @@ def main():
             })
             time.sleep(0.005)
 
-    threading.Thread(target=pub).start()
+    # threading.Thread(target=pub).start()
     threading.Thread(target=robot._write_cmd).start()
-    threading.Thread(target=robot._update_state).start()
+    
+    loop_cnt = mp.Value("i", 0)
+    policy_cnt = mp.Value("i", 0)
+    
+    mp.Process(target=loop_rate, args=(loop_cnt, policy_cnt)).start()
 
     try:
         inp = {
@@ -575,45 +612,28 @@ def main():
             "adapt_hx": np.zeros((1, 128), dtype=np.float32),
             "context_adapt_hx": np.zeros((1, 128), dtype=np.float32),
         }
-        inf_time_sum = 0
-        t0 = time.perf_counter()
+        
+        timer = Timer(0.005)
         for i in itertools.count():
             iter_start = time.perf_counter()
+            robot._update_state(i)
+            if i % 4 == 0:
+                robot.update_state()
+                obs = robot.get_obs()
+                inp["command_"]  = robot.command[None, ...]
+                inp["policy"]   = obs[None, ...]
+                inp["is_init"]  = np.array([False], dtype=bool)
+                
+                action, carry = policy(inp)
+                robot.apply_action(action)
+                inp = carry
+                policy_cnt.value += 1
 
-            obs = robot.get_obs()
-            inp["command"]  = robot.command[None, ...]
-            inp["policy"]   = obs[None, ...]
-            inp["is_init"]  = np.array([False], dtype=bool)
-            
-            action, carry = policy(inp)
-            inf_time = time.perf_counter() - iter_start
-            inf_time_sum += inf_time
-
-            robot.apply_action(action)
-
-            inp = carry
-
-            if i % 50 == 0:
-                # print(action)
-                print(robot.jpos_isaac.reshape(3, 4))
-                print(robot.gravity)
-                # print(robot.command)
-                # print(robot.robot_state.state_update_interval)
-                # print(robot.phi)
-                print(f"Step: {i}, Control freq: {i / (time.perf_counter() - t0)}")
-                # print(f"time_since_state_update: {robot.robot_state.time_since_state_update}")
-                # print(f"state_update_interval: {robot.robot_state.state_update_interval}")
-                # print(f"time_since_control_update: {robot.robot_state.time_since_control_update}")
-                # print(f"time_since_control_application: {robot.robot_state.time_since_control_application}")
-                # print(f"control_application_since_state_update: {robot.robot_state.control_application_since_state_update}")
-                # print(inf_time_sum / (i + 1))
-                # print(robot.robot_state.rpy)
-                # print(robot.robot_state.acc - robot.acc_bias, robot.robot_state.gyro)
-                # print(robot.robot_state.time_since_state_update, robot.robot_state.state_update_interval)
-                # print(robot.jpos_sdk.reshape(4, 3))
-                # print(robot.sdk_to_orbit(robot.jpos_sdk).reshape(3, 4))
-
-            time.sleep(max(0, 0.02 - (time.perf_counter() - iter_start)))
+            if i % 200 == 0:
+                print(robot.command)
+            # robot._send_command()
+            loop_cnt.value += 1
+            timer.sleep()
 
     except KeyboardInterrupt:
         print("End")

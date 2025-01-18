@@ -16,6 +16,7 @@ from scipy.spatial.transform import Rotation as R
 from go2deploy import ONNXModule, init_channel
 from go2deploy.utils import lerp, normalize
 from go2deploy.robot import Go2Iface
+from go2deploy.commands import VelocityControl
 
 from torch.utils._pytree import tree_map
 from dataclasses import dataclass
@@ -61,21 +62,30 @@ class ImpedanceControl:
         self.jvel_multistep = np.zeros((self.obs_cfg.jvel_steps, 12))
         self.gyro_multistep = np.zeros((self.obs_cfg.gyro_steps, 3))
         self.gravity_multistep = np.zeros((self.obs_cfg.gravity_steps, 3))
+        self.target_yaw = self.robot.robot_state.rpy[2]
     
     def update_command(self):
         mass = 3 
-        lin_kp = (10 + 2) * 0.5 + (10 - 2) * 0.5 * self.robot.robot_state.rxy[1]
+        lin_kp = 24 + 16 * self.robot.robot_state.rxy[1]
         lin_kd = 2. * math.sqrt(lin_kp)
 
-        ang_kp = 16.
+        ang_kp = 24 # lin_kp
         ang_kd = 2. * math.sqrt(ang_kp)
 
-        self.command[0] = self.robot.robot_state.lxy[1] * lin_kd / lin_kp
-        self.command[1] = - self.robot.robot_state.lxy[0] * lin_kd / lin_kp
-        self.command[2] = 0.0 # 0.2 * self.rxy[1] - rpy[1] # pitch
+        # self.command[0] = self.robot.robot_state.lxy[1] * lin_kd / lin_kp
+        # self.command[1] = - self.robot.robot_state.lxy[0] * lin_kd / lin_kp
+        # self.target_yaw = self.target_yaw - 0.02 * self.robot.robot_state.rxy[0]
+        # self.target_yaw = self.target_yaw * 0.98 + self.robot.robot_state.rpy[2] * 0.02
+        print(self.target_yaw)
+
+        yaw_diff = wrap_to_pi(self.target_yaw - self.robot.robot_state.rpy[2])
+
+        self.command[0] = 2.2 * self.robot.robot_state.lxy[1]
+        self.command[1] = - self.robot.robot_state.lxy[0]
+        self.command[2] = yaw_diff
         self.command[3:5] = self.command[:2] * lin_kp
         self.command[5:8] = lin_kd
-        self.command[8] = - 1.0 * self.robot.robot_state.rxy[0] # yaw
+        self.command[8] = ang_kp * yaw_diff # yaw
         self.command[9:10] = mass
 
         dt = 0.02
@@ -147,11 +157,35 @@ def loop_rate(loop_cnt: mp.Value, policy_cnt: mp.Value):
         timer.sleep()
 
 
+def wrap_to_pi(angles):
+    r"""Wraps input angles (in radians) to the range :math:`[-\pi, \pi]`.
+
+    This function wraps angles in radians to the range :math:`[-\pi, \pi]`, such that
+    :math:`\pi` maps to :math:`\pi`, and :math:`-\pi` maps to :math:`-\pi`. In general,
+    odd positive multiples of :math:`\pi` are mapped to :math:`\pi`, and odd negative
+    multiples of :math:`\pi` are mapped to :math:`-\pi`.
+
+    The function behaves similar to MATLAB's `wrapToPi <https://www.mathworks.com/help/map/ref/wraptopi.html>`_
+    function.
+
+    Args:
+        angles: Input angles of any shape.
+
+    Returns:
+        Angles in the range :math:`[-\pi, \pi]`.
+    """
+    # wrap to [0, 2*pi)
+    wrapped_angle = (angles + np.pi) % (2 * np.pi)
+    # map to [-pi, pi]
+    # we check for zero in wrapped angle to make it go to pi when input angle is odd multiple of pi
+    return np.where((wrapped_angle == 0) & (angles > 0), np.pi, wrapped_angle - np.pi)
+
+
 @torch.inference_mode()
 # @set_exploration_type(ExplorationType.MODE)
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--path", type=str)
+    parser.add_argument("-p", "--path", type=str, default=None)
     parser.add_argument("-l", "--log", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -174,10 +208,13 @@ def main():
         log_file = None
 
     robot = Go2Iface({})
-    client = ImpedanceControl(robot, BasicObsCfg())    
+    # client = ImpedanceControl(robot, BasicObsCfg())    
+    client = VelocityControl(robot, BasicObsCfg())
 
     path = args.path
-    if path.endswith(".onnx"):
+    if path is None:
+        policy = None
+    elif path.endswith(".onnx"):
         backend = "onnx"
         policy_module = ONNXModule(path)
         def policy(inp):
@@ -229,6 +266,9 @@ def main():
                 inp = carry
                 policy_cnt.value += 1
             
+            if i % 200 == 0:
+                print("gravity:", robot.robot_state.projected_gravity)
+                print("action:", action)
             loop_cnt.value += 1
             timer.sleep()
 

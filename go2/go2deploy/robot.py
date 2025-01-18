@@ -110,7 +110,8 @@ class Go2Iface:
         self.robot_state.rpy = np.asarray(self._robot_state.rpy)
         self.robot_state.angvel = np.asarray(self._robot_state.gyro)
         self.rot = R.from_quat(self._robot_state.quat, scalar_first=True)
-        
+        self.robot_state.projected_gravity = self.rot.inv().apply(np.array([0., 0., -1.]))
+
         self.robot_state.lxy = lerp(self.robot_state.lxy, self._robot.lxy(), 0.5)
         self.robot_state.rxy = lerp(self.robot_state.rxy, self._robot.rxy(), 0.5)
     

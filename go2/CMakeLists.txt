@@ -13,9 +13,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-lto")
-# set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-lto")
-# set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-lto")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-lto")
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
 
 pybind11_add_module(go2py src/py.cpp)
 target_link_libraries(go2py PRIVATE unitree_sdk2)
